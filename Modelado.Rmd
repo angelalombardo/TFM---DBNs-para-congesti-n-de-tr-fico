@@ -1,0 +1,1015 @@
+---
+title: "TFM"
+author: "Ángela Lombardo Hernández"
+date: "03 de Septiembre de 2024"
+output: html_document
+---
+
+## Librerías
+
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(reshape2)
+if (!require("igraph")) install.packages("igraph", dependencies=TRUE)
+library(igraph)
+library(rlang)
+if (!require("data.table")) install.packages("data.table", dependencies=TRUE)
+library(data.table)
+```
+
+## Datos
+
+```{r}
+setwd("C:/Users/angel/OneDrive - Universidad Complutense de Madrid (UCM)/Escritorio/TECI/Máster/TFM/Código")
+
+df <- read.csv("datos_total.csv")
+
+# Se eliminan variables: X, PROVINCIA y MUNICIPIO
+df <- subset(df, select = -c(1,2,3))
+```
+
+## Limpieza
+
+```{r}
+# Filtra el dataframe para incluir solo los contaminantes de interés
+df_contaminantes <- df %>% filter(MAGNITUD %in% c(9, 10, 8, 14, 1))
+
+# Listado de días y correspondientes códigos de verificación
+dias <- paste0("D", sprintf("%02d", 1:31))
+verf <- paste0("V", sprintf("%02d", 1:31))
+
+# Formato long del dataframe
+# Días
+df_dias <- df_contaminantes %>%
+  pivot_longer(cols = all_of(dias), names_to = "DIA", values_to = "VALOR")
+
+# Verificaciones
+df_verf <- df_contaminantes %>%
+  pivot_longer(cols = all_of(verf), names_to = "VER", values_to = "VV")
+
+# Asociar los valores de verificación
+df_dias <- df_dias %>% mutate(VV = df_verf$VV)
+df_dias <- df_dias[,c('ESTACION', 'MAGNITUD', 'PUNTO_MUESTREO', 'ANO', 'MES', 'DIA', 'VALOR', 'VV')]
+```
+
+```{r, warning=FALSE}
+# Creación de la columna 'date'
+df_dias <- df_dias %>%
+  mutate(DIA = gsub("D", "", DIA),date = ymd(paste(ANO, MES, DIA, sep = "-")))
+
+# Eliminación de los registros con días inexistentes
+df_dias <- df_dias %>% drop_na(date)
+
+# Reordenación de las columnas
+df_dias <- df_dias %>%
+  select(ESTACION, MAGNITUD, PUNTO_MUESTREO, ANO, MES, DIA, date, VALOR, VV)
+
+# Reordenación de los registros por fecha
+df_dias <- df_dias %>% arrange(ESTACION, MAGNITUD, ANO, MES)
+```
+
+```{r}
+# Comprobación valores nulos y duplicados
+print("Número de valores nulos en las diferentes variables:")
+sapply(df_dias, function(x) sum(is.na(x)))
+
+# Asignación de valores missing
+df_dias$VALOR[df_dias$VV != "V"] <- NA
+print(paste("Número de datos no verificados:", sum(is.na(df_dias$VALOR))))
+print(paste("Número de registros duplicados:", sum(duplicated(df_dias))))
+
+df_dias <- df_dias %>% select(-VV)
+```
+
+## Imputación
+
+```{r}
+df <- df_dias %>% select(-c(PUNTO_MUESTREO, ANO, MES, DIA))
+
+# Renombrar magnitudes
+nombres_magnitudes <- c(`1` = 'SO2', `8` = 'NO2', `9` = 'PM2.5', `10` = 'PM10', `14` = 'O3')
+df$MAGNITUD <- recode(df$MAGNITUD, !!!nombres_magnitudes)
+# Convertir las columna MAGNITUD a factor
+df$MAGNITUD <- as.factor(df$MAGNITUD)
+
+# Renombrar zonas
+zona1 <- c(8, 48, 50, 11, 10, 4, 5, 3, 47, 9)
+zona2 <- c(20, 13, 54)
+zona3 <- c(16, 57, 55, 27, 86, 59)
+zona4 <- c(58, 24)
+zona5 <- c(56, 18, 17)
+
+df <- df %>% mutate(ESTACION = ifelse(ESTACION %in% zona1, "Zona 1", ESTACION))
+df <- df %>% mutate(ESTACION = ifelse(ESTACION %in% zona2, "Zona 2", ESTACION))
+df <- df %>% mutate(ESTACION = ifelse(ESTACION %in% zona3, "Zona 3", ESTACION))
+df <- df %>% mutate(ESTACION = ifelse(ESTACION %in% zona4, "Zona 4", ESTACION))
+df <- df %>% mutate(ESTACION = ifelse(ESTACION %in% zona5, "Zona 5", ESTACION))
+
+# Cambiar el nombre de la columna ESTACION a ZONA
+df <- df %>% rename(ZONA = ESTACION)
+
+# Convertir la columna ZONA a factor
+df$ZONA <- as.factor(df$ZONA)
+
+# Eliminar los registros de estaciones que no pertenecen a las zonas
+df <- df[df$ZONA %in% c("Zona 1", "Zona 2", "Zona 3", "Zona 4", "Zona 5"), ]
+df$ZONA <- droplevels(df$ZONA)
+```
+
+```{r}
+# Aplicar dcast
+df <- dcast(df, ZONA + date ~ MAGNITUD, value.var = "VALOR", fun.aggregate = mean, na.rm=TRUE)
+
+print("Número de valores nulos en las diferentes variables:")
+sapply(df, function(x) sum(is.na(x)))
+```
+
+### Imputacion NO2
+
+```{r}
+missing_NO2 <- df %>%
+  group_by(ZONA) %>%
+  summarise(
+    missing_NO2 = sum(is.na(NO2)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Contar los valores faltantes en la columna NO2, agrupados por mes y zona
+missing_month_NO2 <- df %>%
+  mutate(mes = month(date)) %>%
+  group_by(ZONA, mes) %>%
+  summarise(
+    missing_NO2 = sum(is.na(NO2)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Mostrar los resultados
+print(missing_month_NO2)
+print(df %>% filter(is.na(NO2)))
+```
+
+```{r}
+# Función para imputar NAs
+imputar_NO2 <- function(data) {
+  data <- data %>%
+    # Usar la función lag y lead para llevar los valores hacia adelante y hacia atrás dentro de cada grupo
+    mutate(NO2_prev = lag(NO2), 
+           NO2_next = lead(NO2)) %>%
+    rowwise() %>%
+    # Calcular la media del día anterior y del día siguiente para los NAs
+    mutate(NO2 = if_else(is.na(NO2), mean(c(NO2_prev, NO2_next), na.rm = TRUE), NO2)) %>%
+    # Eliminar las columnas auxiliares
+    select(-NO2_prev, -NO2_next)
+  
+  return(data)
+}
+
+# Aplicar la función al dataframe
+df <- imputar_NO2(df)
+sapply(df, function(x) sum(is.na(x)))
+```
+
+### Imputacion O3
+
+```{r}
+missing_O3 <- df %>%
+  group_by(ZONA) %>%
+  summarise(
+    missing_O3 = sum(is.na(O3)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Contar los valores faltantes en la columna 'valores', agrupados por mes y zona
+missing_month_O3 <- df %>%
+  mutate(mes = month(date)) %>%
+  group_by(ZONA, mes) %>%
+  summarise(
+    missing_O3 = sum(is.na(O3)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Mostrar los resultados
+print(missing_month_O3)
+
+# Contar los valores faltantes en la columna 'valores', agrupados por mes dia y zona
+missing_monthday_O3 <- df %>%
+  mutate(mes = month(date), dia = day(date)) %>%
+  group_by(ZONA, mes, dia) %>%
+  summarise(
+    missing_O3 = sum(is.na(O3)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Mostrar los resultados
+print(missing_monthday_O3)
+print(df %>% filter(is.na(O3)))
+table(df$ZONA, is.na(df$O3))
+```
+
+```{r}
+# Inicializar una nueva columna O3_imputed igual a O3
+df$O3_imputed <- df$O3
+# Paso 1: Imputar utilizando la media del día anterior y del día posterior
+for (i in 2:(nrow(df) - 1)) {
+  if (is.na(df$O3[i])) {
+    if (!is.na(df$O3[i - 1]) | !is.na(df$O3[i + 1])) {
+      df$O3_imputed[i] <- mean(c(df$O3[i - 1], df$O3[i + 1]), na.rm = TRUE)
+    }
+  }
+}
+
+# Paso 2: Calcular la media de O3 para las zonas 3, 4 y 5 y realizar la imputación si aún hay valores faltantes
+mean_O3_zonas_3_4_5 <- df %>%
+  filter(ZONA %in% c("Zona 3", "Zona 4", "Zona 5")) %>%
+  group_by(date) %>%
+  summarise(mean_O3 = mean(O3, na.rm = TRUE))
+
+# Unirse con el dataframe original para imputar los valores faltantes en Zona 1 y Zona 2
+df <- df %>%
+  left_join(mean_O3_zonas_3_4_5, by = "date") %>%
+  mutate(O3_imputed = if_else(is.na(O3), mean_O3, O3)) %>%
+  select(-mean_O3) # Eliminar la columna auxiliar mean_O3 si ya no es necesaria
+
+# Asignar el valor imputado a la columna original O3
+df$O3 <- df$O3_imputed
+
+# Eliminar la columna auxiliar O3_imputed si ya no es necesaria
+df <- df %>% select(-O3_imputed)
+
+sapply(df, function(x) sum(is.na(x)))
+```
+
+### Imputación PM10
+
+```{r}
+missing_PM10 <- df %>%
+  group_by(ZONA) %>%
+  summarise(
+    missing_PM10 = sum(is.na(PM10)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Contar los valores faltantes en la columna 'valores', agrupados por mes y zona
+missing_month_PM10 <- df %>%
+  mutate(mes = month(date)) %>%
+  group_by(ZONA, mes) %>%
+  summarise(
+    missing_PM10 = sum(is.na(PM10)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Mostrar los resultados
+print(missing_month_PM10)
+
+# Contar los valores faltantes en la columna 'valores', agrupados por mes dia y zona
+missing_monthday_PM10 <- df %>%
+  mutate(mes = month(date), dia = day(date)) %>%
+  group_by(ZONA, mes, dia) %>%
+  summarise(
+    missing_PM10 = sum(is.na(PM10)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Mostrar los resultados
+print(missing_monthday_PM10)
+print(df %>% filter(is.na(PM10)))
+table(df$ZONA, is.na(df$PM10))
+```
+
+```{r}
+# Imputamos los valores missing de la Zona 3
+for (i in 2:(nrow(df) - 1)) {
+  if (df$ZONA[i] == "Zona 3" & is.na(df$PM10[i])) {
+    if (!is.na(df$PM10[i - 1]) | !is.na(df$PM10[i + 1])) {
+      df$PM10[i] <- mean(c(df$PM10[i - 1], df$PM10[i + 1]), na.rm = TRUE)
+    }
+  }
+}
+# Comprobamos que se han imputado
+table(df$ZONA, is.na(df$PM10))
+print(df %>% filter(is.na(PM10)))
+```
+
+```{r}
+# Inicializar una nueva columna PM10_imputed igual a PM10
+df$PM10_imputed <- df$PM10
+# Paso 1: Imputar utilizando la media del día anterior y del día posterior
+for (i in 2:(nrow(df) - 1)) {
+  if (is.na(df$PM10[i])) {
+    if (!is.na(df$PM10[i - 1]) | !is.na(df$PM10[i + 1])) {
+      df$PM10_imputed[i] <- mean(c(df$PM10[i - 1], df$PM10[i + 1]), na.rm = TRUE)
+    }
+  }
+}
+
+# Paso 2: Calcular la media de PM10 para las zonas 1 y 3 y realizar la imputación si aún hay valores faltantes
+mean_PM10_zonas_1_3 <- df %>%
+  filter(ZONA %in% c("Zona 1", "Zona 3")) %>%
+  group_by(date) %>%
+  summarise(mean_PM10 = mean(PM10, na.rm = TRUE))
+
+# Unirse con el dataframe original para imputar los valores faltantes en Zona 1 y Zona 2
+df <- df %>%
+  left_join(mean_PM10_zonas_1_3, by = "date") %>%
+  mutate(PM10_imputed = if_else(is.na(PM10), mean_PM10, PM10)) %>%
+  select(-mean_PM10) # Eliminar la columna auxiliar mean_PM10 si ya no es necesaria
+
+# Asignar el valor imputado a la columna original PM10
+df$PM10 <- df$PM10_imputed
+
+# Eliminar la columna auxiliar PM10_imputed si ya no es necesaria
+df <- df %>% select(-PM10_imputed)
+
+sapply(df, function(x) sum(is.na(x)))
+```
+
+### Imputación PM2.5
+
+```{r}
+# Cargar la librería necesaria
+if (!requireNamespace("mice", quietly = TRUE)) {
+    install.packages("mice")}
+library(mice)
+
+# Crear un dataframe temporal solo con las columnas PM10 y PM2.5
+df_temp <- df[, c("PM10", "PM2.5")]
+
+# Imputar los valores faltantes en el dataframe temporal usando mice
+df_temp_imputed <- mice(df_temp, method = "pmm", m = 1)
+
+# Extraer los valores imputados para PM2.5
+imputed_PM2.5 <- complete(df_temp_imputed, "long", include = FALSE)$PM2.5
+
+# Asignar los valores imputados al dataframe original
+df$PM2.5[is.na(df$PM2.5)] <- imputed_PM2.5
+
+sapply(df, function(x) sum(is.na(x)))
+```
+
+### Imputación SO2
+
+```{r}
+missing_SO2 <- df %>%
+  group_by(ZONA) %>%
+  summarise(
+    missing_SO2 = sum(is.na(SO2)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Contar los valores faltantes en la columna 'valores', agrupados por mes y zona
+missing_month_SO2 <- df %>%
+  mutate(mes = month(date)) %>%
+  group_by(ZONA, mes) %>%
+  summarise(
+    missing_SO2 = sum(is.na(SO2)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Mostrar los resultados
+print(missing_month_SO2)
+
+# Contar los valores faltantes en la columna 'valores', agrupados por mes dia y zona
+missing_monthday_SO2 <- df %>%
+  mutate(mes = month(date), dia = day(date)) %>%
+  group_by(ZONA, mes, dia) %>%
+  summarise(
+    missing_SO2 = sum(is.na(SO2)),
+    .groups = 'drop'  # Eliminar el agrupamiento después de resumir
+  )
+
+# Mostrar los resultados
+print(missing_monthday_SO2)
+print(df %>% filter(is.na(SO2)))
+table(df$ZONA, is.na(df$SO2))
+```
+
+```{r}
+# Imputamos los valores missing de las zonas 1 que no son de días seguidos
+for (i in 2:(nrow(df) - 1)) {
+  if ((df$ZONA[i] == "Zona 1") & is.na(df$SO2[i])) {
+    if (!is.na(df$SO2[i - 1]) | !is.na(df$SO2[i + 1])) {
+      df$SO2[i] <- mean(c(df$SO2[i - 1], df$SO2[i + 1]), na.rm = TRUE)
+    }
+  }
+}
+# Comprobamos que se han imputado
+table(df$ZONA, is.na(df$SO2))
+print(df %>% filter(is.na(SO2)))
+```
+
+```{r}
+# Inicializar una nueva columna SO2_imputed igual a SO2
+df$SO2_imputed <- df$SO2
+# Paso 1: Imputar utilizando la media del día anterior y del día posterior
+for (i in 2:(nrow(df) - 1)) {
+  if ((df$ZONA[i] == "Zona 3") & is.na(df$SO2[i])) {
+    if (!is.na(df$SO2[i - 1]) | !is.na(df$SO2[i + 1])) {
+      df$SO2_imputed[i] <- mean(c(df$SO2[i - 1], df$SO2[i + 1]), na.rm = TRUE)
+    }
+  }
+}
+# Asignar el valor imputado a la columna original SO2
+df$SO2 <- df$SO2_imputed
+# Eliminar la columna auxiliar SO2_imputed si ya no es necesaria
+df <- df %>% select(-SO2_imputed)
+# Comprobamos cuantos missing quedan en la Zona 3
+table(df$ZONA, is.na(df$SO2))
+
+
+# Paso 2: Identificar periodos con valores faltantes en Zona 3
+# Filtramos los datos para Zona 3 y NA en SO2
+df_zona3_na <- df %>% filter(is.na(SO2) & ZONA == "Zona 3")
+
+# Calculamos la diferencia de días entre fechas consecutivas
+df_zona3_na$diff <- as.numeric(df_zona3_na$date - lag(df_zona3_na$date))
+df_zona3_na$diff[1] <- 1
+
+# Creamos un nuevo grupo cada vez que la diferencia de días es mayor que 1
+df_zona3_na$periodo <- cumsum(df_zona3_na$diff > 1)
+
+# Eliminamos la columna 'diff'
+df_zona3_na <- df_zona3_na %>% select(-diff)
+
+
+# Filtrar los datos por zona
+df_zona1 <- df %>% filter(ZONA == "Zona 1") %>% arrange(date)
+df_zona3 <- df %>% filter(ZONA == "Zona 3") %>% arrange(date)
+df_zona3 <- merge(df_zona3, df_zona3_na[, c("date", "periodo")], by = "date", all.x = TRUE)
+
+# Mostrar los periodos detectados
+na_periods <- df_zona3 %>%
+  filter(is.na(SO2)) %>%
+  group_by(periodo) %>%
+  summarize(start_date = min(date) - days(1), end_date = max(date))
+
+# Imputar valores faltantes en cada periodo
+for (i in 1:nrow(na_periods)) {
+  # Fecha previa al periodo con NA
+  last_non_na_date <- na_periods$start_date[i]
+  
+  # Valor previo en SO2 de Zona 3 y Zona 1
+  prev_value_zona3 <- df_zona3 %>% filter(date == last_non_na_date) %>% pull(SO2)
+  prev_value_zona1 <- df_zona1 %>% filter(date == last_non_na_date) %>% pull(SO2)
+  
+  # Calcula la tasa
+  rate <- prev_value_zona3 / prev_value_zona1
+  
+  # Imputa los valores faltantes en SO2 de Zona 3 para el periodo
+  df_zona3 <- df_zona3 %>%
+    mutate(SO2 = ifelse(date >= na_periods$start_date[i] + days(1) & date <= na_periods$end_date[i], 
+                        df_zona1$SO2 * rate, 
+                        SO2))
+}
+
+# Añadir los valores imputados de SO2 de Zona 3 al dataframe original df solo para los registros de Zona 3
+df <- df %>%
+  left_join(df_zona3 %>% filter(ZONA == "Zona 3") %>% select(date, SO2), by = "date", suffix = c("", ".imputed"))
+
+# Reemplazar los valores originales de SO2 con los valores imputados donde haya NA y pertenezcan a Zona 3
+df$SO2 <- ifelse(is.na(df$SO2) & df$ZONA == "Zona 3", df$SO2.imputed, df$SO2)
+
+# Eliminar las columnas de SO2 imputado
+df <- df %>% select(-ends_with(".imputed"))
+
+# Comprobamos que no quedan missing en la Zona 3
+table(df$ZONA, is.na(df$SO2))
+sapply(df, function(x) sum(is.na(x)))
+```
+
+```{r}
+# Inicializar una nueva columna SO2_imputed igual a SO2
+df$SO2_imputed <- df$SO2
+# Paso 1: Imputar utilizando la media del día anterior y del día posterior
+for (i in 2:(nrow(df) - 1)) {
+  if (is.na(df$SO2[i])) {
+    if (!is.na(df$SO2[i - 1]) | !is.na(df$SO2[i + 1])) {
+      df$SO2_imputed[i] <- mean(c(df$SO2[i - 1], df$SO2[i + 1]), na.rm = TRUE)
+    }
+  }
+}
+
+# Paso 2: Calcular la media de SO2 para las zonas 1 y 3 y realizar la imputación si aún hay valores faltantes
+mean_SO2_zonas_1_3 <- df %>%
+  filter(ZONA %in% c("Zona 1", "Zona 3")) %>%
+  group_by(date) %>%
+  summarise(mean_SO2 = mean(SO2, na.rm = TRUE))
+
+# Unirse con el dataframe original para imputar los valores faltantes en Zona 1 y Zona 2
+df <- df %>%
+  left_join(mean_SO2_zonas_1_3, by = "date") %>%
+  mutate(SO2_imputed = if_else(is.na(SO2), mean_SO2, SO2)) %>%
+  select(-mean_SO2) # Eliminar la columna auxiliar mean_SO2 si ya no es necesaria
+
+# Asignar el valor imputado a la columna original SO2
+df$SO2 <- df$SO2_imputed
+
+# Eliminar la columna auxiliar SO2_imputed si ya no es necesaria
+df <- df %>% select(-SO2_imputed)
+
+sapply(df, function(x) sum(is.na(x)))
+```
+
+## MODELO MULTIVARIANTE
+
+```{r}
+list_of_dfs <- split(df, df$ZONA)
+df_zona1 <- list_of_dfs$`Zona 1` %>% select(-ZONA) %>% rename("NO2_Z1" = NO2, "O3_Z1" = O3, "PM10_Z1" = PM10, "PM2.5_Z1" = PM2.5, "SO2_Z1" = SO2)
+df_zona2 <- list_of_dfs$`Zona 2` %>% select(-ZONA) %>% rename("NO2_Z2" = NO2, "O3_Z2" = O3, "PM10_Z2" = PM10, "PM2.5_Z2" = PM2.5, "SO2_Z2" = SO2)
+df_zona3 <- list_of_dfs$`Zona 3` %>% select(-ZONA) %>% rename("NO2_Z3" = NO2, "O3_Z3" = O3, "PM10_Z3" = PM10, "PM2.5_Z3" = PM2.5, "SO2_Z3" = SO2)
+df_zona4 <- list_of_dfs$`Zona 4` %>% select(-ZONA) %>% rename("NO2_Z4" = NO2, "O3_Z4" = O3, "PM10_Z4" = PM10, "PM2.5_Z4" = PM2.5, "SO2_Z4" = SO2)
+df_zona5 <- list_of_dfs$`Zona 5` %>% select(-ZONA) %>% rename("NO2_Z5" = NO2, "O3_Z5" = O3, "PM10_Z5" = PM10, "PM2.5_Z5" = PM2.5, "SO2_Z5" = SO2)
+
+df_multiv <- df_zona1 %>% 
+  left_join(df_zona2, by = "date") %>%
+  left_join(df_zona3, by = "date") %>%
+  left_join(df_zona4, by = "date") %>%
+  left_join(df_zona5, by = "date") %>% 
+  select(-date)
+  
+```
+
+
+# Inferencia
+
+```{r}
+if (!require("dbnR")) install.packages("dbnR", dependencies = TRUE)
+library(dbnR)
+
+size = 2
+dt_train <- df_multiv[1:3700,]
+f_dt_train <- fold_dt(dt_train, size)
+
+dt_test <- df_multiv[3701:4383,]
+f_dt_test <- fold_dt(dt_test, size)
+
+net <- learn_dbn_struc(dt_train, size)
+fit <- fit_dbn_params(net, f_dt_train)
+
+plot(fit)
+```
+
+Las variables con t1 es el pasado y las variables con t0 es el presente.
+
+
+
+## Gráficos
+
+```{r}
+predicciones <- c()
+for (i in 1:nrow(dt_test)){
+  ev <- f_dt_test[i, .SD, .SDcols = grep("t_1$", colnames(f_dt_test), value = TRUE)]
+  pred <- (dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev))$mu_p
+  predicciones <- c(predicciones, as.numeric(pred["O3_Z5_t_0",]))  }
+
+
+# Gráfico base con valores reales
+plot(dt_test$O3_Z5, type = "l", col = "blue", xlab = "Índice del conjunto de test", ylab = "Valor")
+
+# Añadir la línea de predicciones en el mismo gráfico
+lines(predicciones, col = "red")
+
+legend("topright", legend = c("Valores Reales", "Predicciones"), col = c("blue", "red"),  
+       lty = 1, cex = 0.8)
+```
+
+## 1. Cambios por contaminante de atras hacia delante
+
+De atrás hacia delante: he cambiado el valor de la variable "NO2_Z1_t1", he fijado el resto del instante t1 y he mirado el cambio en la variable "NO2_Z1_t0".
+
+```{r}
+big_med <- function(datos, numero) {
+  # Calcular los cuartiles y la mediana
+  Q1 <- quantile(datos, 0.25)
+  Q3 <- quantile(datos, 0.75)
+  mediana <- median(datos)
+  
+  # Calcular el rango intercuartílico (IQR)
+  IQR <- Q3 - Q1
+  
+  # Calcular los bigotes
+  bigote_inferior <- max(min(datos), Q1 - 1.5 * IQR)
+  bigote_superior <- min(max(datos), Q3 + 1.5 * IQR)
+  
+  # Verificar si el número está dentro del rango intercuartílico
+  if (numero >= Q1 & numero <= Q3) {
+    return(c(bigote_inferior, bigote_superior))
+  } else {
+    return(mediana)
+  }
+}
+```
+
+```{r}
+t1_vars <- grep("t_1$", colnames(f_dt_test), value = TRUE)
+var <- "NO2_Z1_t_1"
+t1_vars <- t1_vars[t1_vars != var]
+
+# Obtener el nombre de la columna correspondiente "t_0"
+var_t0 <- sub("t_1$", "t_0", var)
+  
+ev_vars <- c(var, t1_vars)
+ev <- f_dt_test[1, .SD, .SDcols = ev_vars]
+  
+pred <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev)
+  
+
+# Realizar la intervención
+ev_i <- f_dt_test[1, .SD, .SDcols = c(var, t1_vars)]
+new_value <- big_med(f_dt_test[[var_t0]], ev_i[[var]])
+    
+ev_i[1, (var) := new_value]
+    
+# Hacer predicción con la intervención
+pred_i <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), ev_i)
+    
+# Mostrar los resultados
+cat(sprintf("Variable: %s\n", var))
+cat(sprintf("The previous value for '%s' is %f, and after the modification it changes to %f\n",
+            var, f_dt_test[1, get(var)], ev_i[1, get(var)]))
+
+cat(sprintf("The prediction for '%s' is %f, and after the modification it changes to %f\n",
+            var_t0, pred$mu_p[var_t0,], pred_i$mu_p[var_t0,]))
+```
+
+
+
+
+### 1.1. Test de hipótesis
+
+```{r}
+n_test <- 6
+vals_test <- data.frame(original = c(), modificado = c())
+for (i in 1:n_test){
+  ev <- f_dt_test[i, .SD, .SDcols = ev_vars]
+  
+  pred <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev)
+      
+  # Realizar la intervención
+  ev_i <- f_dt_test[i, .SD, .SDcols = ev_vars]
+  new_value <- big_med(f_dt_test[[var_t0]], ev_i[[var]])
+  
+  ev_i[1, (var) := new_value]
+    
+  # Hacer predicción con la intervención
+  pred_i <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), ev_i)
+    
+  vals_test <- rbind(vals_test, data.frame(original = pred$mu_p[var_t0,],
+                                           modificado = pred_i$mu_p[var_t0,]))
+}
+
+print(vals_test)
+```
+
+#### 1.1.1. Pruebas de variabilidad
+
+```{r, message=FALSE}
+# 1. Prueba F de varianzas (F-test)
+resultado_ftest <- var.test(vals_test$original, vals_test$modificado)
+cat("Prueba F de varianzas (F-test)")
+print(resultado_ftest)  
+cat("El p-valor es menor que 0.05, lo que indica que hay una diferencia significativa entre las varianzas de los dos vectores.\n\n")
+
+
+
+# 2. Prueba de Levene
+# Instalar y cargar el paquete car si no lo tienes
+if (!require(car)) install.packages("car")
+library(car)
+
+# Combinar los vectores en un data frame
+data_levene <- data.frame(
+  valores = c(vals_test$original, vals_test$modificado),
+  grupo = factor(rep(c("original", "modificado"), each = nrow(vals_test)))
+)
+
+# Realizar la prueba de Levene
+resultado_levene <- leveneTest(valores ~ grupo, data = data_levene)
+cat("\n Prueba de Levene")
+print(resultado_levene)
+cat("El p-valor es menor que 0.05, lo que sugiere que las varianzas de los dos vectores son significativamente diferentes.\n\n")
+
+
+# 3. Prueba de Bartlett
+resultado_bartlett <- bartlett.test(list(vals_test$original, vals_test$modificado))
+cat("\n Prueba de Bartlett")
+print(resultado_bartlett)
+cat("El p-valor es menor que 0.05, lo que sugiere que las varianzas de los dos vectores son significativamente diferentes.")
+```
+
+
+### 1.3. Cambio en t2
+```{r}
+t1_vars <- grep("t_1$", colnames(f_dt_test), value = TRUE)
+var <- "NO2_Z1_t_1"
+t1_vars <- t1_vars[t1_vars != var]
+
+# Obtener el nombre de la columna correspondiente "t_0"
+var_t0 <- sub("t_1$", "t_0", var)
+  
+ev_vars <- c(var, t1_vars)
+ev <- f_dt_test[2, .SD, .SDcols = ev_vars]
+  
+pred2 <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev)
+  
+
+# Realizar la intervención
+ev_2i <- f_dt_test[2, .SD, .SDcols = c(var, t1_vars)]
+    
+ev_2i[1, (var) := pred_i$mu_p[var_t0,]]
+    
+# Hacer predicción con la intervención
+pred_2i <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), ev_2i)
+    
+# Mostrar los resultados
+cat(sprintf("Variable: %s\n\n", var))
+
+cat(sprintf("Con el cambio total, la predicción original de la variable pasa de ser %f y a tomar el valor: %f\n", pred2$mu_p[var_t0,], pred_2i$mu_p[var_t0,]))
+```
+
+
+### 1.4. Cómo han de ser los valores pasados para bajar x puntos los valores futuros.
+
+```{r}
+t1_vars <- grep("t_1$", colnames(f_dt_test), value = TRUE)
+var <- "PM10_Z3_t_1"
+t1_vars <- t1_vars[t1_vars != var]
+
+# Obtener el nombre de la columna correspondiente "t_0"
+var_t0 <- sub("t_1$", "t_0", var)
+  
+ev_vars <- c(var, t1_vars)  # colnames(f_dt_test)[colnames(f_dt_test) != var_t0]
+ev <- f_dt_test[1, .SD, .SDcols = ev_vars]
+  
+pred <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev)
+  
+# Comprobar si la columna correspondiente "t_0" existe en f_dt_test
+if (var_t0 %in% colnames(f_dt_test)) {
+    
+  # Realizar la intervención
+  ev_i <- f_dt_test[1, .SD, .SDcols = c(var, t1_vars)]
+  new_value <- ev_i[[var]]-10
+    
+  ev_i[1, (var) := new_value]
+    
+  # Hacer predicción con la intervención
+  pred_i <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), ev_i)
+    
+  # Mostrar los resultados
+  cat(sprintf("Variable: %s\n", var))
+  cat(sprintf("The previous value for '%s' is %f, and after the modification it changes to %f\n", 
+            var, f_dt_test[1, get(var)], ev_i[1, get(var)]))
+  cat(sprintf("The prediction for '%s' is %f, and after the modification it changes to %f\n\n", 
+            var_t0, pred$mu_p[var_t0,], pred_i$mu_p[var_t0,]))}
+
+```
+
+
+
+## 2. Cambios por contaminante de delante hacia atras
+
+De delante hacia atrás: he cambiado el valor de la variable "NO2_Z1_t0", he fijado el resto del instante t0 y he mirado el cambio en la variable "NO2_Z1_t1".
+
+```{r}
+t0_vars <- grep("t_0$", colnames(f_dt_test), value = TRUE)
+var <- "NO2_Z1_t_0"
+t0_vars <- t0_vars[t0_vars != var]
+
+# Obtener el nombre de la columna correspondiente "t_0"
+var_t1 <- sub("t_0$", "t_1", var)
+  
+ev_vars <- c(var, t0_vars)
+ev <- f_dt_test[1, .SD, .SDcols = ev_vars]
+  
+pred <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev)
+  
+    
+# Realizar la intervención
+ev_i <- f_dt_test[1, .SD, .SDcols = ev_vars]
+new_value <- big_med(f_dt_test[[var_t1]], ev_i[[var]])
+    
+ev_i[1, (var) := new_value]
+    
+# Hacer predicción con la intervención
+pred_i <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), ev_i)
+    
+# Mostrar los resultados
+cat(sprintf("Variable: %s\n", var))
+cat(sprintf("The previous value for '%s' is %f, and after the modification it changes to %f\n",
+            var, f_dt_test[1, get(var)], ev_i[1, get(var)]))
+cat(sprintf("The previous value for '%s' is %f, and after the modification it changes to %f\n",
+            var_t1, pred$mu_p[var_t1,], pred_i$mu_p[var_t1,]))
+
+
+```
+
+### 2.1. Test de hipótesis
+
+```{r}
+n_test <- 6
+vals_test <- data.frame(original = c(), modificado = c())
+for (i in 1:n_test){
+  ev <- f_dt_test[i, .SD, .SDcols = ev_vars]
+  
+  pred <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev)
+      
+  # Realizar la intervención
+  ev_i <- f_dt_test[i, .SD, .SDcols = ev_vars]
+  new_value <- big_med(f_dt_test[[var_t0]], ev_i[[var]])
+  
+  ev_i[1, (var) := new_value]
+    
+  # Hacer predicción con la intervención
+  pred_i <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), ev_i)
+    
+  vals_test <- rbind(vals_test, data.frame(original = pred$mu_p[var_t1,], modificado = 
+                                             pred_i$mu_p[var_t1,]))
+}
+
+print(vals_test)
+```
+
+
+
+## 3. Comparacion de modelo con zonas colindantes con modelo con zonas no colindantes.
+
+```{r}
+#Modelo con zonas colindantes para la zona 3
+ev_vars_col <- names(f_dt_test)[grepl("Z2_t_1|Z4_t_1$", names(f_dt_test))] #t_1 solo porque se fijan las variables del pasado
+ev_col <- f_dt_test[1, .SD, .SDcols = ev_vars_col]
+
+pred_col <- (dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev_col))$mu_p
+
+pred_col_Z3 <- data.frame(t(pred_col[grep("Z3_t_0", rownames(pred_col)), , drop = FALSE])) #t_0 solo porque nos interesan las variables del futuro
+real_Z3 <- data.frame(f_dt_test[1, .SD, .SDcols = names(f_dt_test)[grep("Z3_t_0", names(f_dt_test))], , drop = FALSE])
+
+# Definir el orden de las columnas por las que se desea ordenar
+columnas_orden <- names(real_Z3)  # Utilizamos las columnas de real_Z3 para ordenar
+
+# Ordenar pred_col_Z3 por las mismas columnas que en real_Z3
+pred_col_Z3 <- pred_col_Z3 %>% select(all_of(columnas_orden)) %>% arrange_all()
+
+# Ordenar real_df por las mismas columnas
+real_Z3 <- real_Z3 %>% arrange_all()
+
+#Error cuadrático medio
+mse_col <- mean((as.numeric(real_Z3) - as.numeric(pred_col_Z3))^2)
+print(paste("Mean Squared Error:", mse_col))
+```
+
+```{r}
+#Modelo con zonas no colindantes para la Zona 3
+ev_vars_nocol <- names(f_dt_test)[grepl("Z5_t_1$", names(f_dt_test))]
+ev_nocol <- f_dt_test[1, .SD, .SDcols = ev_vars_nocol]
+
+pred_nocol <- (dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev_nocol))$mu_p
+
+pred_nocol_Z3 <- data.frame(t(pred_nocol[grep("Z3_t_0", rownames(pred_nocol)), , drop = FALSE]))
+
+# Ordenar pred_col_Z3 por las mismas columnas que en real_Z3
+pred_col_Z3 <- pred_col_Z3 %>% select(all_of(columnas_orden)) %>% arrange_all()
+
+#Error cuadrático medio
+mse_nocol <- mean((as.numeric(real_Z3) - as.numeric(pred_nocol_Z3))^2)
+print(paste("Mean Squared Error:", mse_nocol))
+```
+
+
+## 4. Con valores missings, cómo predigo el futuro.
+### 4.1 No se tiene dato de la variable O3 en la Zona 5 pero si en el resto de las zonas
+```{r}
+missing_1 <- "O3_Z5_t_1"
+ev_1 <- f_dt_test[1, .SD, .SDcols = setdiff(names(f_dt_test)[grepl("t_1$", names(f_dt_test))], missing_1)]
+
+pred_1 <- (dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev_1))$mu_p
+
+pred_missing_1 <- pred_1[grep("^O3_Z5", colnames(f_dt_test), value=TRUE),]
+real_missing_1 <- data.frame(f_dt_test[1, .SD, .SDcols = grep("^O3_Z5", colnames(f_dt_test))])
+
+#Error cuadrático medio de predicción
+mse_missing_pred_1 <- mean((as.numeric(real_missing_1[1,1]) - as.numeric(pred_missing_1[1]))^2)
+print(paste("Mean Squared Error of Prediction:", mse_missing_pred_1))
+
+#Error cuadrático medio del missing
+mse_missing_1 <- mean((as.numeric(real_missing_1[missing_1]) - as.numeric(pred_missing_1[missing_1]))^2)
+print(paste("Mean Squared Error of Missing Value:", mse_missing_1))
+```
+
+
+### 4.2. No se tiene dato de la variable O3 en ninguna zona pero si del resto de contaminantes
+```{r}
+missing_2 <- names(f_dt_test)[grepl("^O3.*t_1$", names(f_dt_test))]
+ev_2 <- f_dt_test[1, .SD, .SDcols = setdiff(names(f_dt_test)[grepl("t_1$", names(f_dt_test))], missing_2)]
+
+pred_2 <- (dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev_2))$mu_p
+
+pred_missing_2 <- pred_2[grep("^O3", colnames(f_dt_test), value=TRUE),]
+real_missing_2 <- data.frame(f_dt_test[1, .SD, .SDcols = grep("^O3", colnames(f_dt_test))])
+
+#Error cuadrático medio de predicción
+mse_missing_pred_2 <- mean((as.numeric(real_missing_2["O3_Z5_t_0"]) - as.numeric(pred_missing_2["O3_Z5_t_0"]))^2)
+print(paste("Mean Squared Error of Prediction:", mse_missing_pred_2))
+
+#Error cuadrático medio del missing
+mse_missing_2 <- mean((as.numeric(real_missing_2[missing_2]) - as.numeric(pred_missing_2[missing_2]))^2)
+print(paste("Mean Squared Error of Missing Value:", mse_missing_2))
+```
+### 4.3. Se tiene todo 
+```{r}
+ev_3 <- f_dt_test[1, .SD, .SDcols = names(f_dt_test)[grepl("t_1$", names(f_dt_test))]]
+
+pred_3 <- (dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev_3))$mu_p
+
+pred_missing_3 <- pred_3["O3_Z5_t_0",]
+real_missing_3 <- data.frame(f_dt_test[1, .SD, .SDcols = "O3_Z5_t_0"])
+
+#Error cuadrático medio de predicción
+mse_missing_pred_3 <- mean((as.numeric(real_missing_3) - as.numeric(pred_missing_3))^2)
+print(paste("Mean Squared Error of Prediction:", mse_missing_pred_3))
+```
+El error de prediccion no varia mucho del modelo con todos los datos al modelo con los datos del resto de las zonas
+
+
+
+## 5. Variabilidad de los resultados al variar los valores de las evidencias.
+
+```{r}
+var <- "NO2_Z1_t_0"
+
+#Datos de la variable "NO2_Z1"
+NO2_Z1 <- df_multiv$NO2_Z1
+
+# Media y desviación estándar de los datos
+media <- mean(NO2_Z1)
+sd <- sd(NO2_Z1)
+
+# Generar valores aleatorios
+set.seed(123)  # Fijar la semilla para reproducibilidad
+n <- 15  # Número de valores a generar
+valores <- rnorm(n, mean = media, sd = sd)
+
+
+vals_test <- data.frame(original = c(), modificado = c())
+for (i in 1:n){
+  ev_vars <- c(var, t0_vars)
+  ev <- f_dt_test[i, .SD, .SDcols = ev_vars]
+  
+  pred <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), evidence = ev)
+      
+  # Realizar la intervención
+  ev_i <- f_dt_test[i, .SD, .SDcols = ev_vars]
+  ev_i[1, (var) := valores[i]]
+    
+  # Hacer predicción con la intervención
+  pred_i <- dbnR::mvn_inference(attr(fit, "mu"), attr(fit, "sigma"), ev_i)
+    
+  # Mostrar los resultados
+  cat(sprintf("Variable: %s\n", var))
+  cat(sprintf("The previous value for '%s' is %f, and after the modification it changes to %f\n",
+            var, f_dt_test[1, get(var)], ev_i[1, get(var)]))
+  cat(sprintf("The previous value for '%s' is %f, and after the modification it changes to %f\n",
+            var_t1, pred$mu_p[var_t1,], pred_i$mu_p[var_t1,]))
+  
+  vals_test <- rbind(vals_test, data.frame(original = pred$mu_p[var_t1,], modificado = 
+                                             pred_i$mu_p[var_t1,]))
+}
+
+print(vals_test)
+```
+
+#### 5.1. Pruebas de variabilidad
+
+```{r, message=FALSE}
+# 1. Prueba F de varianzas (F-test)
+resultado_ftest <- var.test(vals_test$original, vals_test$modificado)
+cat("Prueba F de varianzas (F-test)")
+print(resultado_ftest)  
+cat("El p-valor es mayor que 0.05, lo que indica que no hay diferencia significativa entre las varianzas de los dos vectores y, por lo tanto, los cambios en las predicciones no tienen que ver con el cambio en las evidencias si no con el resto de variables.\n\n")
+
+
+
+# 2. Prueba de Levene
+# Instalar y cargar el paquete car si no lo tienes
+if (!require(car)) install.packages("car")
+library(car)
+
+# Combinar los vectores en un data frame
+data_levene <- data.frame(
+  valores = c(vals_test$original, vals_test$modificado),
+  grupo = factor(rep(c("original", "modificado"), each = nrow(vals_test)))
+)
+
+# Realizar la prueba de Levene
+resultado_levene <- leveneTest(valores ~ grupo, data = data_levene)
+cat("\n Prueba de Levene")
+print(resultado_levene)
+cat("El p-valor es mayor que 0.05, lo que sugiere que las varianzas de los dos vectores no son significativamente diferentes y, por lo tanto, los cambios en las predicciones no tienen que ver con el cambio en las evidencias si no con el resto de variables.\n\n")
+
+
+# 3. Prueba de Bartlett
+resultado_bartlett <- bartlett.test(list(vals_test$original, vals_test$modificado))
+cat("\n Prueba de Bartlett")
+print(resultado_bartlett)
+cat("El p-valor es mayor que 0.05, lo que sugiere que las varianzas de los dos vectores no son significativamente diferentes y, por lo tanto, los cambios en las predicciones no tienen que ver con el cambio en las evidencias si no con el resto de variables.")
+```
